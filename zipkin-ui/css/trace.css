@@ -66,8 +66,7 @@
 }
 
 #trace-container .span .handle .service-name {
-  background: #0084b4;
-  color: #fff;
+  color: #ffffff;
   padding: 2px;
 }
 
@@ -163,6 +162,15 @@
 #trace-container .span[data-error-type="critical"].depth-3 .duration { background: rgba(230, 162, 161, 0.60); }
 #trace-container .span[data-error-type="critical"].depth-4 .duration { background: rgba(230, 162, 161, 0.80); }
 #trace-container .span[data-error-type="critical"].depth-5 .duration { background: rgba(230, 162, 161, 1); }
+
+
+#trace-container .span .handle .service-name.depth-0 { background: rgba(45, 79, 198, 1);  }
+#trace-container .span .handle .service-name.depth-1 { background: rgba(45, 79, 198, 0.9);  }
+#trace-container .span .handle .service-name.depth-2 { background: rgba(45, 79, 198, 0.8); }
+#trace-container .span .handle .service-name.depth-3 { background: rgba(45, 79, 198, 0.7);  }
+#trace-container .span .handle .service-name.depth-4 { background: rgba(45, 79, 198, 0.6);   }
+#trace-container .span .handle .service-name.depth-5 { background: rgba(45, 79, 198, 0.5);   }
+
 
 #trace-controls form {
   margin-bottom: 10px;

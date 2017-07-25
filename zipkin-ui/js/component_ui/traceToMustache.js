@@ -5,7 +5,8 @@ import {
   getServiceDurations,
   getServiceNames,
   getServiceName,
-  mkDurationStr
+  mkDurationStr,
+  getDurationClass
 } from './traceSummary';
 import {Constants, ConstantNames} from './traceConstants';
 
@@ -156,9 +157,10 @@ export default function traceToMustache(trace, logsUrl = undefined) {
         serviceName: getServiceName(span) || '',
         duration: span.duration,
         durationStr: mkDurationStr(span.duration),
+        durationClass: getDurationClass(span.duration),
         left: parseFloat(spanStartTs - traceTimestamp) / parseFloat(summary.duration) * 100,
         width: width < 0.1 ? 0.1 : width,
-        depth: (spanDepth + 1) * 5,
+        depth: (spanDepth + 1) * 5 * 3 - 25,
         depthClass: (spanDepth - 1) % 6,
         children: (groupByParentId[span.id] || []).map((s) => s.id).join(','),
         annotations: (span.annotations || []).map((a) => ({

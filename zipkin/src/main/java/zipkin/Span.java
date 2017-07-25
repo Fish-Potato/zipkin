@@ -163,7 +163,7 @@ public final class Span implements Comparable<Span>, Serializable { // for Spark
     this.traceId = builder.traceId;
     this.traceIdHigh = builder.traceIdHigh != null ? builder.traceIdHigh : 0L;
     this.name = checkNotNull(builder.name, "name").isEmpty() ? ""
-        : builder.name.toLowerCase(Locale.ROOT);
+        : builder.name;
     this.id = builder.id;
     this.parentId = builder.parentId;
     this.timestamp = builder.timestamp;

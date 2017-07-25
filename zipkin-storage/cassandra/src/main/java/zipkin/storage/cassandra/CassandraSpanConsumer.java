@@ -13,10 +13,8 @@
  */
 package zipkin.storage.cassandra;
 
-import com.datastax.driver.core.BoundStatement;
-import com.datastax.driver.core.PreparedStatement;
-import com.datastax.driver.core.RegularStatement;
-import com.datastax.driver.core.Session;
+import com.alibaba.fastjson.JSON;
+import com.datastax.driver.core.*;
 import com.datastax.driver.core.querybuilder.Insert;
 import com.datastax.driver.core.querybuilder.QueryBuilder;
 import com.google.common.annotations.VisibleForTesting;
@@ -28,13 +26,28 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import java.nio.ByteBuffer;
-import java.util.List;
+import java.nio.charset.Charset;
+import java.util.*;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import com.ihomefnt.common.cache.local.LocalCache;
+import com.ihomefnt.common.cache.local.LocalCacheCallback;
+import com.ihomefnt.common.simhash.core.DefaultSimHashCalculator;
+import com.ihomefnt.common.simhash.core.SimHashCalculator;
+import com.ihomefnt.common.simhash.fingerprint.DefaultMd5FingerPrintCalculator;
+import com.ihomefnt.common.simhash.tokenizer.DefaultSimHashTokenizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import zipkin.BinaryAnnotation;
 import zipkin.Codec;
 import zipkin.Span;
 import zipkin.internal.Nullable;
 import zipkin.internal.Pair;
+import zipkin.stack.StackTrace;
 import zipkin.storage.guava.GuavaSpanConsumer;
 
 import static com.google.common.util.concurrent.Futures.transform;
@@ -42,6 +55,7 @@ import static zipkin.internal.ApplyTimestampAndDuration.guessTimestamp;
 import static zipkin.storage.cassandra.CassandraUtil.bindWithName;
 
 final class CassandraSpanConsumer implements GuavaSpanConsumer {
+  private static final Executor executor = Executors.newCachedThreadPool();
   private static final Logger LOG = LoggerFactory.getLogger(CassandraSpanConsumer.class);
   private static final long WRITTEN_NAMES_TTL
       = Long.getLong("zipkin.store.cassandra.internal.writtenNamesTtl", 60 * 60 * 1000);
@@ -57,9 +71,12 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
   private final PreparedStatement insertSpan;
   private final PreparedStatement insertServiceName;
   private final PreparedStatement insertSpanName;
+  private final PreparedStatement insertServiceTreeRoot;
+  private final PreparedStatement insertServiceTree;
   private final Schema.Metadata metadata;
   private final DeduplicatingExecutor deduplicatingExecutor;
   private final CompositeIndexer indexer;
+
 
   CassandraSpanConsumer(Session session, int bucketCount, int spanTtl, int indexTtl,
       @Nullable CacheBuilderSpec indexCacheSpec) {
@@ -88,6 +105,20 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
             .value("bucket", 0) // bucket is deprecated on this index
             .value("span_name", QueryBuilder.bindMarker("span_name"))));
 
+    insertServiceTreeRoot = session.prepare(
+      maybeUseTtl(QueryBuilder
+        .insertInto("root_tree")
+        .value("key",QueryBuilder.bindMarker("key"))
+        .value("root_service", QueryBuilder.bindMarker("root_service"))
+        .value("service_tree", QueryBuilder.bindMarker("service_tree"))));
+
+    insertServiceTree = session.prepare(
+      maybeUseTtl(QueryBuilder
+        .insertInto("service_call")
+        .value("service_name",QueryBuilder.bindMarker("service_name"))
+        .value("parent_service", QueryBuilder.bindMarker("parent_service"))
+        .value("root_service", QueryBuilder.bindMarker("root_service"))));
+
     deduplicatingExecutor = new DeduplicatingExecutor(session, WRITTEN_NAMES_TTL);
     indexer = new CompositeIndexer(session, indexCacheSpec, bucketCount, this.indexTtl);
   }
@@ -104,6 +135,7 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
    */
   @Override
   public ListenableFuture<Void> accept(List<Span> rawSpans) {
+    storeServiceCallTree(rawSpans);
     ImmutableSet.Builder<ListenableFuture<?>> futures = ImmutableSet.builder();
 
     ImmutableList.Builder<Span> spans = ImmutableList.builder();
@@ -134,6 +166,206 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
     }
     futures.addAll(indexer.index(spans.build()));
     return transform(Futures.allAsList(futures.build()), TO_VOID);
+  }
+
+  /**
+   * #####################################
+   */
+  private void storeServiceCallTree(List<Span> sampled) {
+    List<Span> spanList = new ArrayList<>(sampled);
+    executor.execute(new Runnable() {
+      @Override
+      public void run() {
+        ServiceCallTree root = buildServiceTree(spanList);
+        if (null != root) {
+          storeCallTreeRoot(root);
+          storeCallTreeNode(root.getChildren(), root, root);
+        }
+      }
+
+      private void storeCallTreeNode(List<ServiceCallTree> children, ServiceCallTree parent, ServiceCallTree root) {
+        if (null == children || children.size() <= 0) {
+          return;
+        }
+        // store service relation
+        for (ServiceCallTree child : children) {
+          BoundStatement bound = CassandraUtil.bindWithName(insertServiceTree, "insert-tree-node")
+            .setString("service_name", child.getServiceName())
+            .setString("parent_service", parent.getServiceName())
+            .setString("root_service", root.getServiceName());
+          if (!metadata.hasDefaultTtl) bound.setInt("ttl_", spanTtl);
+          deduplicatingExecutor.maybeExecuteAsync(bound, child.getServiceName() + "."
+            + parent.getServiceName() + "." + root.getServiceName());
+          // 递归存储子节点
+          storeCallTreeNode(child.getChildren(), child, root);
+        }
+      }
+
+      /**
+       * @param root
+       */
+      private void storeCallTreeRoot(ServiceCallTree root) {
+        SimHashCalculator calculator = DefaultSimHashCalculator.DefaultSimHashCalculatorBuilder.aDefaultSimHashCalculator()
+          .fingerPrintCalculator(new DefaultMd5FingerPrintCalculator())
+          .simHashTokenizer(new DefaultSimHashTokenizer())
+          .build();
+
+        String serviceTreeJson = JSON.toJSONString(root);
+        String key = calculator.getSimHash(serviceTreeJson);
+        // store root
+        BoundStatement bound = CassandraUtil.bindWithName(insertServiceTreeRoot, "insert-tree-root")
+          .setString("key", key)
+          .setString("root_service", root.getServiceName())
+          .setString("service_tree", serviceTreeJson);
+
+        BoundStatement nodeBound = CassandraUtil.bindWithName(insertServiceTree, "insert-tree-node")
+          .setString("service_name", root.getServiceName())
+          .setString("parent_service", "")
+          .setString("root_service", "");
+        if (!metadata.hasDefaultTtl) bound.setInt("ttl_", spanTtl);
+        deduplicatingExecutor.maybeExecuteAsync(bound, key);
+        deduplicatingExecutor.maybeExecuteAsync(nodeBound, root.getServiceName());
+      }
+    });
+  }
+
+  private ServiceCallTree buildServiceTree(List<Span> sampled) {
+    Span rootSpan = null;
+    for (Span span : sampled) {
+      if (span.parentId == null) {
+        rootSpan =span;
+        break;
+      }
+    }
+    if (null != rootSpan) {
+      ServiceCallTree root = new ServiceCallTree();
+      root.setServiceName(buildServiceName(rootSpan));
+      root.setSpanId(rootSpan.id);
+      sampled.remove(rootSpan);
+      buildChildren(root, sampled);
+      return root;
+    }
+
+    return null;
+  }
+
+  private String buildServiceName(Span span) {
+    // 优先从stackTrace中取serviceName
+    for (BinaryAnnotation binaryAnnotation : span.binaryAnnotations) {
+      if (binaryAnnotation.key.equals("stackTrace")) {
+        StackTrace stackTrace = JSON.parseObject(new String(binaryAnnotation.value, Charset.forName("UTF-8")), StackTrace.class);
+        if (null != stackTrace.getServiceName() && stackTrace.getServiceName().length() > 0) {
+          return stackTrace.getServiceName();
+        }
+      }
+    }
+
+    for (BinaryAnnotation binaryAnnotation : span.binaryAnnotations) {
+      if ("http.url".equals(binaryAnnotation.key)) {
+        String value = new String(binaryAnnotation.value, Charset.forName("UTF-8"));
+        Pattern urlPathVariablePattern = Pattern.compile(".*/[0-9]+/.*");
+        Matcher matcher = urlPathVariablePattern.matcher(value);
+        if (matcher.matches()) {
+          value = value.split("/[0-9]+/")[0];
+        }
+        if (!value.startsWith("http://")) {
+          value = value.replace("/",".");
+          if (value.startsWith(".")) {
+            return value.substring(value.indexOf(".") + 1);
+          }
+          return value;
+        }
+      }
+    }
+
+    for (BinaryAnnotation binaryAnnotation : span.binaryAnnotations) {
+      if ("http.url".equals(binaryAnnotation.key)) {
+        String value = new String(binaryAnnotation.value, Charset.forName("UTF-8"));
+        Pattern urlPathVariablePattern = Pattern.compile(".*/[0-9]+/.*");
+        Matcher matcher = urlPathVariablePattern.matcher(value);
+        if (matcher.matches()) {
+          value = value.split("/[0-9]+/")[0];
+        }
+        value = value.replaceAll("http://[^/]+/","");
+        return value.replace("/",".");
+      }
+    }
+    return null;
+  }
+
+
+  private void buildChildren(ServiceCallTree serviceCallTree, List<Span> spans) {
+    if (spans == null || spans.size() == 0) {
+      return ;
+    }
+    List<Span> removeList = new ArrayList<>();
+    for (Span span : spans) {
+      if (span.parentId.equals(serviceCallTree.getSpanId())) {
+        serviceCallTree.addChild(span);
+        removeList.add(span);
+      }
+    }
+
+    if (removeList.size()==0) {
+      // 已到叶子节点
+      serviceCallTree.setLeaf(true);
+      return ;
+    }
+    // 去除已经构造过的span
+    spans.removeAll(removeList);
+
+    // 递归生成树
+    for (ServiceCallTree tree : serviceCallTree.getChildren()) {
+      buildChildren(tree, spans);
+    }
+
+  }
+
+
+   class ServiceCallTree {
+
+    private Long spanId;
+
+    private String serviceName;
+
+    private boolean leaf;
+
+    private List<ServiceCallTree> children = new ArrayList<>();
+
+    public String getServiceName() {
+      return serviceName;
+    }
+
+    public void setServiceName(String serviceName) {
+      this.serviceName = serviceName;
+    }
+
+    public List<ServiceCallTree> getChildren() {
+      return children;
+    }
+
+    public Long getSpanId() {
+      return spanId;
+    }
+
+    public void setSpanId(Long spanId) {
+      this.spanId = spanId;
+    }
+
+    public void addChild(Span span) {
+      ServiceCallTree child = new ServiceCallTree();
+      child.setSpanId(span.id);
+      child.setServiceName(buildServiceName(span));
+      children.add(child);
+    }
+
+    public boolean isLeaf() {
+      return leaf;
+    }
+
+    public void setLeaf(boolean leaf) {
+      this.leaf = leaf;
+    }
   }
 
   /**

@@ -13,14 +13,21 @@
  */
 package zipkin.server;
 
-import java.util.List;
+import java.nio.charset.Charset;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
+
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
+import com.google.common.collect.Lists;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.util.CollectionUtils;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -30,8 +37,11 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.context.request.WebRequest;
-import zipkin.Codec;
-import zipkin.Span;
+import zipkin.*;
+import zipkin.stack.JsonUtils;
+import zipkin.stack.StackTrace;
+import zipkin.stack.TraceEntry;
+import zipkin.stack.TraceException;
 import zipkin.storage.QueryRequest;
 import zipkin.storage.StorageComponent;
 
@@ -60,6 +70,10 @@ public class ZipkinQueryApiV1 {
   volatile int serviceCount; // used as a threshold to start returning cache-control headers
 
   private final StorageComponent storage;
+
+  private ThreadLocal<Map<String,Long>> idMapLocal = new ThreadLocal<>();
+
+  private ThreadLocal<Long> autoIdLocal = new ThreadLocal<>();
 
   @Autowired
   public ZipkinQueryApiV1(StorageComponent storage) {
@@ -119,8 +133,11 @@ public class ZipkinQueryApiV1 {
     if (trace == null) {
       throw new TraceNotFoundException(traceIdHex, traceIdHigh, traceIdLow);
     }
-    return new String(Codec.JSON.writeSpans(trace), UTF_8);
+    String result = new String(Codec.JSON.writeSpans(addStackTraceSpan(trace)), UTF_8);
+
+    return parseString(result);
   }
+
 
   @ExceptionHandler(TraceNotFoundException.class)
   @ResponseStatus(HttpStatus.NOT_FOUND)
@@ -145,5 +162,160 @@ public class ZipkinQueryApiV1 {
       response.cacheControl(CacheControl.maxAge(namesMaxAge, TimeUnit.SECONDS).mustRevalidate());
     }
     return response.body(names);
+  }
+
+  private List<Span> addStackTraceSpan(List<Span> trace) {
+    List<Span> withStackTraceSpan = new ArrayList<>();
+    List<Span> traceCopy = Lists.newArrayList(trace);
+    // 0x100000000
+    long stackSpanId = 4294967296L;
+    for (Span span : trace) {
+      for (BinaryAnnotation binaryAnnotation : span.binaryAnnotations) {
+        if (binaryAnnotation.key.equals("stackTrace")) {
+          StackTrace stackTrace = JSON.parseObject(new String(binaryAnnotation.value, Charset.forName("UTF-8")), StackTrace.class);
+          for (TraceEntry traceEntry : stackTrace.getEntryList()) {
+            String level = traceEntry.getLevel();
+            long enterTime = traceEntry.getEnterTimestamp();
+            long exitTime = traceEntry.getExitTimestamp();
+            TraceException traceException = null;
+            if (!CollectionUtils.isEmpty(stackTrace.getTraceExceptionSet())) {
+              for (TraceException traceE : stackTrace.getTraceExceptionSet()) {
+                if (isCurrentException(traceE, traceEntry)) {
+                  traceException = traceE;
+                }
+              }
+            }
+            Span.Builder builder = Span.builder();
+
+            builder.id(stackSpanId + getStackSpanId(traceEntry.getLevel()));
+            if (null != getParentStackSpanId(level)) {
+              builder.parentId(stackSpanId + getParentStackSpanId(level));
+            } else {
+              builder.parentId(span.id);
+            }
+            builder.duration(exitTime - enterTime);
+            builder.name(buildSpanName(traceEntry));
+            builder.timestamp(enterTime);
+            builder.traceId(span.traceId);
+            builder.traceIdHigh(span.traceIdHigh);
+
+            Endpoint serviceEndpoint = binaryAnnotation.endpoint;
+            Endpoint stackEndpoint = Endpoint.create(traceEntry.getEvent(), serviceEndpoint.ipv4);
+
+            builder.addAnnotation(Annotation.create(enterTime,
+              traceEntry.getEvent(), stackEndpoint));
+
+            builder.addBinaryAnnotation(BinaryAnnotation.create("sa", serviceEndpoint.serviceName, stackEndpoint));
+
+            builder.addBinaryAnnotation(BinaryAnnotation.create(
+              "class", traceEntry.getClassName(), stackEndpoint));
+            builder.addBinaryAnnotation(BinaryAnnotation.create(
+              "method", traceEntry.getMethod(), stackEndpoint));
+            if (null != traceEntry.getParams()) {
+              builder.addBinaryAnnotation(BinaryAnnotation.create(
+                "param", JsonUtils.obj2json(traceEntry.getParams()), stackEndpoint));
+            }
+
+            builder.addBinaryAnnotation(BinaryAnnotation.create(
+              "event", traceEntry.getEvent(), stackEndpoint));
+            if (null != traceException) {
+              builder.addBinaryAnnotation(BinaryAnnotation.create(
+                "exception", JSON.toJSONString(traceException),stackEndpoint));
+              builder.addAnnotation(Annotation.create(enterTime,"error",stackEndpoint));
+              builder.name(buildSpanName(traceEntry) + ": throw Exception!");
+            }
+
+            Span stackSpan = builder.build();
+            withStackTraceSpan.add(stackSpan);
+          }
+          stackSpanId += 4294967296L;
+        }
+      }
+    }
+    if (!CollectionUtils.isEmpty(withStackTraceSpan)) {
+      traceCopy.addAll(withStackTraceSpan);
+    }
+    return traceCopy;
+  }
+
+  private String buildSpanName(TraceEntry traceEntry) {
+    String className = traceEntry.getClassName();
+    if (className.contains(".")) {
+      className = className.substring(className.lastIndexOf(".")+1);
+    }
+    return className + "." + traceEntry.getMethod();
+  }
+
+  private boolean isCurrentException(TraceException traceE, TraceEntry traceEntry) {
+    if (traceE.getClassName().equals(traceEntry.getClassName())) {
+      if (traceE.getMethodName().equals(traceEntry.getMethod())) {
+        return true;
+      }
+      if (traceE.getMethodName().equals("afterCompletion") && traceEntry.getMethod().equals("preHandle")) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+
+  /**
+   * 通过映射表将 a.b.c.d的层级标识 转成long型id
+   * @param level
+   * @return
+   */
+  private Long getStackSpanId(String level) {
+    if (null == idMapLocal.get()) {
+      idMapLocal.set(new HashMap<>());
+    }
+    if (null == autoIdLocal.get()) {
+      autoIdLocal.set(0L);
+    }
+    Long autoId = autoIdLocal.get();
+    Map<String, Long> idMap = idMapLocal.get();
+    if (idMap.containsKey(level)) {
+      return idMap.get(level);
+    } else {
+      autoId++;
+      idMap.put(level, autoId);
+      autoIdLocal.set(autoId);
+      return autoId;
+    }
+  }
+
+  private Long getParentStackSpanId(String level) {
+    if (!level.contains(".")) {
+      return null;
+    }
+    return idMapLocal.get().get(level.substring(0,level.lastIndexOf(".")));
+  }
+
+
+  private String parseString (String result) {
+    try {
+      if (result.contains("stackTrace")) {
+        JSONArray resultArray = JSON.parseArray(result);
+        Object removeObject = null;
+        for (Object o : resultArray) {
+          JSONObject jsonObject = (JSONObject) o;
+
+          for (Object bA : jsonObject.getJSONArray("binaryAnnotations")) {
+            JSONObject binaryAnnotation = (JSONObject) bA;
+            if (binaryAnnotation.containsKey("key")) {
+              if (binaryAnnotation.getString("key").equals("stackTrace")) {
+                removeObject = binaryAnnotation;
+                break;
+              }
+            }
+          }
+          if (null != removeObject) {
+            jsonObject.getJSONArray("binaryAnnotations").remove(removeObject);
+          }
+        }
+        return resultArray.toJSONString();
+      }
+    } catch (Exception ignored) {
+    }
+    return result;
   }
 }

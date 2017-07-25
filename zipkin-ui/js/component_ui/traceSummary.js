@@ -220,6 +220,20 @@ export function mkDurationStr(duration) {
   }
 }
 
+export function getDurationClass(duration) {
+  if (duration < 50000) {
+    return 1;
+  } else if (duration < 100000) {
+    return 2;
+  } else if (duration < 300000) {
+    return 3;
+  } else if (duration < 500000) {
+    return 4;
+  } else {
+    return 5;
+  }
+}
+
 function removeEmptyFromArray(array) {
   const newArray = [];
   for (let i = 0; i < array.length; i++) {
