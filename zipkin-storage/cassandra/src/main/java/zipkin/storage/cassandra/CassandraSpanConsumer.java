@@ -14,6 +14,7 @@
 package zipkin.storage.cassandra;
 
 import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.annotation.JSONField;
 import com.datastax.driver.core.*;
 import com.datastax.driver.core.querybuilder.Insert;
 import com.datastax.driver.core.querybuilder.QueryBuilder;
@@ -30,16 +31,14 @@ import java.nio.charset.Charset;
 import java.util.*;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import com.ihomefnt.common.cache.local.LocalCache;
-import com.ihomefnt.common.cache.local.LocalCacheCallback;
 import com.ihomefnt.common.simhash.core.DefaultSimHashCalculator;
 import com.ihomefnt.common.simhash.core.SimHashCalculator;
 import com.ihomefnt.common.simhash.fingerprint.DefaultMd5FingerPrintCalculator;
 import com.ihomefnt.common.simhash.tokenizer.DefaultSimHashTokenizer;
+import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import zipkin.BinaryAnnotation;
@@ -223,8 +222,8 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
           .setString("parent_service", "")
           .setString("root_service", "");
         if (!metadata.hasDefaultTtl) bound.setInt("ttl_", spanTtl);
-        deduplicatingExecutor.maybeExecuteAsync(bound, key);
-        deduplicatingExecutor.maybeExecuteAsync(nodeBound, root.getServiceName());
+        if (StringUtils.isNotEmpty(key)) deduplicatingExecutor.maybeExecuteAsync(bound, key);
+        if (StringUtils.isNotEmpty(root.getServiceName())) deduplicatingExecutor.maybeExecuteAsync(nodeBound, root.getServiceName());
       }
     });
   }
@@ -300,7 +299,7 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
     }
     List<Span> removeList = new ArrayList<>();
     for (Span span : spans) {
-      if (span.parentId.equals(serviceCallTree.getSpanId())) {
+      if (null != span.parentId && span.parentId.equals(serviceCallTree.getSpanId())) {
         serviceCallTree.addChild(span);
         removeList.add(span);
       }
@@ -324,6 +323,7 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
 
    class ServiceCallTree {
 
+    @JSONField(serialize = false,deserialize = false)
     private Long spanId;
 
     private String serviceName;
@@ -353,10 +353,13 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
     }
 
     public void addChild(Span span) {
-      ServiceCallTree child = new ServiceCallTree();
-      child.setSpanId(span.id);
-      child.setServiceName(buildServiceName(span));
-      children.add(child);
+      String serviceName = buildServiceName(span);
+      if (StringUtils.isNotEmpty(serviceName)) {
+        ServiceCallTree child = new ServiceCallTree();
+        child.setSpanId(span.id);
+        child.setServiceName(serviceName);
+        children.add(child);
+      }
     }
 
     public boolean isLeaf() {
