@@ -13,10 +13,6 @@
  */
 package zipkin.server;
 
-import java.nio.charset.Charset;
-import java.util.*;
-import java.util.concurrent.TimeUnit;
-
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
@@ -28,14 +24,7 @@ import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.CollectionUtils;
-import org.springframework.web.bind.annotation.CrossOrigin;
-import org.springframework.web.bind.annotation.ExceptionHandler;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestMethod;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.ResponseStatus;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 import org.springframework.web.context.request.WebRequest;
 import zipkin.*;
 import zipkin.stack.JsonUtils;
@@ -44,6 +33,13 @@ import zipkin.stack.TraceEntry;
 import zipkin.stack.TraceException;
 import zipkin.storage.QueryRequest;
 import zipkin.storage.StorageComponent;
+
+import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import static org.springframework.http.MediaType.APPLICATION_JSON_VALUE;
 import static zipkin.internal.Util.UTF_8;
@@ -247,13 +243,10 @@ public class ZipkinQueryApiV1 {
   }
 
   private boolean isCurrentException(TraceException traceE, TraceEntry traceEntry) {
-    if (traceE.getClassName().equals(traceEntry.getClassName())) {
-      if (traceE.getMethodName().equals(traceEntry.getMethod())) {
-        return true;
-      }
-      if (traceE.getMethodName().equals("afterCompletion") && traceEntry.getMethod().equals("preHandle")) {
-        return true;
-      }
+    Long parentIdEntry = getParentStackSpanId(traceEntry.getLevel());
+    if (null != parentIdEntry && parentIdEntry.equals(getParentStackSpanId(traceE.getLevel()))) {
+      return Integer.valueOf(traceE.getLevel().substring(traceE.getLevel().lastIndexOf(".")+1))
+        .equals(Integer.valueOf(traceEntry.getLevel().substring(traceEntry.getLevel().lastIndexOf(".")+1))+1);
     }
     return false;
   }

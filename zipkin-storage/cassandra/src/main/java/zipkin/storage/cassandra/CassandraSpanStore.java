@@ -13,47 +13,37 @@
  */
 package zipkin.storage.cassandra;
 
-import com.datastax.driver.core.BoundStatement;
-import com.datastax.driver.core.PreparedStatement;
-import com.datastax.driver.core.ProtocolVersion;
-import com.datastax.driver.core.ResultSet;
-import com.datastax.driver.core.Row;
-import com.datastax.driver.core.Session;
+import com.alibaba.fastjson.JSON;
+import com.datastax.driver.core.*;
+import com.datastax.driver.core.querybuilder.Insert;
 import com.datastax.driver.core.querybuilder.QueryBuilder;
 import com.google.common.base.Function;
-import com.google.common.collect.ContiguousSet;
-import com.google.common.collect.FluentIterable;
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Iterators;
-import com.google.common.collect.Ordering;
-import com.google.common.collect.Range;
-import com.google.common.util.concurrent.AsyncFunction;
-import com.google.common.util.concurrent.Futures;
-import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.collect.*;
+import com.google.common.util.concurrent.*;
+
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Date;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.nio.charset.Charset;
+import java.util.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import zipkin.Codec;
-import zipkin.DependencyLink;
-import zipkin.Span;
+import org.springframework.util.CollectionUtils;
+import org.springframework.util.StringUtils;
+import zipkin.*;
 import zipkin.internal.CorrectForClockSkew;
 import zipkin.internal.Dependencies;
 import zipkin.internal.DependencyLinker;
 import zipkin.internal.GroupByTraceId;
 import zipkin.internal.MergeById;
 import zipkin.internal.Nullable;
+import zipkin.stack.StackTrace;
 import zipkin.storage.QueryRequest;
 import zipkin.storage.guava.GuavaSpanStore;
 
@@ -87,6 +77,11 @@ public final class CassandraSpanStore implements GuavaSpanStore {
   private final PreparedStatement selectTraceIdsBySpanName;
   private final PreparedStatement selectTraceIdsByAnnotation;
   private final Function<ResultSet, Map<Long, Long>> traceIdToTimestamp;
+  private final DeduplicatingExecutor deduplicatingExecutor;
+  private final PreparedStatement insertServiceTree;
+  private final PreparedStatement updateServiceTree;
+  private final PreparedStatement insertServiceTreeNode;
+  private final PreparedStatement selectServiceTree;
 
   CassandraSpanStore(Session session, int bucketCount, int maxTraceCols, int indexFetchMultiplier,
       boolean strictTraceId) {
@@ -175,6 +170,36 @@ public final class CassandraSpanStore implements GuavaSpanStore {
       }
       return result;
     };
+
+    insertServiceTree = session.prepare(
+      useTtl(QueryBuilder
+        .insertInto("zeus_service_tree")
+        .value("tag",QueryBuilder.bindMarker("tag"))
+        .value("node_path", QueryBuilder.bindMarker("nodePath"))));
+
+    insertServiceTreeNode = session.prepare(
+      useTtl(QueryBuilder
+        .insertInto("zeus_service_node")
+        .value("service_name",QueryBuilder.bindMarker("serviceName"))
+        .value("parent_service", QueryBuilder.bindMarker("parentService"))
+        .value("root_service", QueryBuilder.bindMarker("rootService"))
+        .value("tag", QueryBuilder.bindMarker("tag"))));
+    deduplicatingExecutor = new DeduplicatingExecutor(session, 3600000);
+
+    selectServiceTree = session.prepare(
+      QueryBuilder.select("tag", "node_path")
+        .from("zeus_service_tree")
+        .where(QueryBuilder.eq("tag", QueryBuilder.bindMarker("tag"))));
+
+    updateServiceTree = session.prepare(QueryBuilder.update("zeus_service_tree")
+      .with(QueryBuilder.addAll("node_path",QueryBuilder.bindMarker("nodePath")))
+      .where(QueryBuilder.eq("tag",QueryBuilder.bindMarker("tag"))));
+
+    executeStoreTree();
+  }
+
+  private RegularStatement useTtl(Insert value) {
+    return value.using(QueryBuilder.ttl(QueryBuilder.bindMarker("ttl_")));
   }
 
   /**
@@ -473,6 +498,361 @@ public final class CassandraSpanStore implements GuavaSpanStore {
       );
     } catch (CharacterCodingException | RuntimeException ex) {
       return immediateFailedFuture(ex);
+    }
+  }
+
+  /**
+   * @Author onefish
+   * add Zeus Plus
+   */
+
+  private final static Integer ZEUS_TTL = 604800000;
+
+  private ListeningScheduledExecutorService scheduledExecutor = MoreExecutors.listeningDecorator(Executors.newSingleThreadScheduledExecutor());
+
+  private Executor zeusExecutor = Executors.newCachedThreadPool();
+
+
+  private void executeStoreTree() {
+    scheduledExecutor.scheduleAtFixedRate(new Runnable() {
+      @Override
+      public void run() {
+        // 避免数据还未录入，减去60秒的误差
+        long endTs = System.currentTimeMillis()-60000;
+        for (int i = 0; i < 5; i++) {
+          zeusExecutor.execute(new ZeusServiceRunnable(endTs-(i*200),2000000));
+        }
+      }
+    }, 10, 1, TimeUnit.SECONDS);
+  }
+
+  class ZeusServiceRunnable implements Runnable {
+
+    private long lookBack;
+
+    private long endTs;
+
+    public ZeusServiceRunnable(long endTs, long lookBack) {
+      this.endTs = endTs;
+      this.lookBack = lookBack;
+    }
+
+    @Override
+    public void run() {
+      QueryRequest.Builder builder = QueryRequest.builder();
+      builder.lookback(lookBack).endTs(endTs);
+      try {
+        List<List<Span>> spansList = getTraces(builder.build()).get();
+        for (List<Span> spans : spansList) {
+          storeServiceTree(spans);
+        }
+      } catch (Exception e) {
+        e.printStackTrace();
+      }
+    }
+
+
+    private void storeServiceTree(List<Span> spans) {
+      if (CollectionUtils.isEmpty(spans)) {
+        return ;
+      }
+      Map<Long,Span> spanMap = new HashMap<>();
+      Set<Long> parentIdSet = Sets.newHashSet();
+      for (Span span : spans) {
+        spanMap.put(span.id,span);
+        if (null != span.parentId) {
+          if (!isSqlQuery(span))
+          parentIdSet.add(span.parentId);
+        }
+      }
+      Long traceId = spans.get(0).traceId;
+      Span rootSpan = spanMap.get(traceId);
+      String rootService = getZeusServiceName(rootSpan);
+      if (StringUtils.isEmpty(rootService)) {
+        return ;
+      }
+      List<String> treePathList = Lists.newArrayList();
+      List<ZeusServiceTreeNode> nodeList = Lists.newArrayList();
+      Set<String> existHelper = Sets.newHashSet();
+      for (Span span : spans) {
+        // 叶节点
+        if (!parentIdSet.contains(span.id) && !isSqlQuery(span)) {
+          String treePath = buildTreePath(span, spanMap);
+          treePathList.add(treePath);
+        }
+        String serviceName = getZeusServiceName(span);
+        if (StringUtils.isEmpty(serviceName)) {
+          continue;
+        }
+        String parentServiceName = getZeusServiceName(spanMap.get(span.parentId));
+        if (!existHelper.contains(serviceName+"->"+parentServiceName)) {
+          ZeusServiceTreeNode treeNode = new ZeusServiceTreeNode();
+          treeNode.serviceName = serviceName;
+          treeNode.parentService = parentServiceName;
+          treeNode.rootService = rootService;
+          existHelper.add(serviceName+"->"+parentServiceName);
+          nodeList.add(treeNode);
+        }
+      }
+      if (CollectionUtils.isEmpty(treePathList)) {
+        return ;
+      }
+
+      String[] treeTag = calculateTreeTag(treePathList);
+      for (ZeusServiceTreeNode zeusServiceTreeNode : nodeList) {
+        zeusServiceTreeNode.treeTag = treeTag[0];
+        storeTreeNode(zeusServiceTreeNode);
+      }
+
+      try {
+        storeTreeTag(treeTag[0], treeTag[1]);
+      } catch (ExecutionException e) {
+        e.printStackTrace();
+      } catch (InterruptedException e) {
+        e.printStackTrace();
+      }
+    }
+
+    private boolean isSqlQuery(Span span) {
+      for (BinaryAnnotation binaryAnnotation : span.binaryAnnotations) {
+        if (binaryAnnotation.key.equals("sql.query")) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    private String[] calculateTreeTag(List<String> treePathList) {
+      Map<String,Integer> treePathCount = new HashMap<>();
+      for (String treePath : treePathList) {
+        int count = 1;
+        if (treePathCount.containsKey(treePath)) {
+          count = treePathCount.get(treePath) + 1;
+        }
+        treePathCount.put(treePath, count);
+      }
+      List<String> sortedTreePath = Lists.newArrayList(treePathCount.keySet());
+      Collections.sort(sortedTreePath);
+      StringBuilder tree = new StringBuilder();
+      StringBuilder tag = new StringBuilder();
+      for (String treePath : sortedTreePath) {
+        int count = treePathCount.get(treePath);
+        tree.append(treePath).append("#").append(count > 1 ? "n" : 1).append(";");
+        tag.append(treePath).append(";");
+      }
+      return new String[]{tag.toString(),tree.toString()};
+    }
+
+    private String buildTreePath(Span currentSpan, Map<Long, Span> spanMap) {
+      Long parentId = currentSpan.parentId;
+      StringBuilder servicePath = new StringBuilder(getZeusServiceName(currentSpan));
+      while(true) {
+        if (null == parentId || !spanMap.containsKey(parentId)) {
+          break;
+        }
+        Span parentSpan = spanMap.get(parentId);
+        parentId = parentSpan.parentId;
+        servicePath.insert(0, getZeusServiceName(parentSpan) + "=>");
+      }
+      return servicePath.toString();
+    }
+
+    private String getZeusServiceName(Span span) {
+      if (null == span) {
+        return "";
+      }
+      // 优先取serviceName
+      for (BinaryAnnotation binaryAnnotation : span.binaryAnnotations) {
+        if (binaryAnnotation.key.equals("serviceName") && null != binaryAnnotation.value) {
+          String serviceName = new String(binaryAnnotation.value, Charset.forName("UTF-8"));
+          if (serviceName.length() > 0) {
+            return serviceName;
+          }
+        }
+      }
+
+      // 然后取stackTrace中的ServiceName
+      for (BinaryAnnotation binaryAnnotation : span.binaryAnnotations) {
+        if (binaryAnnotation.key.equals("stackTrace")) {
+          StackTrace stackTrace = JSON.parseObject(new String(binaryAnnotation.value, Charset.forName("UTF-8")), StackTrace.class);
+          if (null != stackTrace.getServiceName() && stackTrace.getServiceName().length() > 0) {
+            return stackTrace.getServiceName();
+          }
+        }
+      }
+      // 为了保证服务名的准确性，根span不从url中取
+      if (null != span.parentId) {
+        String serviceGroup = span.annotations.get(0).endpoint.serviceName;
+        String serviceName = getFromUrl(span);
+        if (!serviceName.startsWith(serviceGroup)) {
+          serviceName = serviceGroup + "." + serviceName;
+        }
+        return serviceName;
+      }
+      return "";
+    }
+
+    /**
+     * 根据url获取服务名
+     * @param span
+     * @return
+     */
+    private String getFromUrl(Span span) {
+      for (BinaryAnnotation binaryAnnotation : span.binaryAnnotations) {
+        if ("http.url".equals(binaryAnnotation.key)) {
+          String value = new String(binaryAnnotation.value, Charset.forName("UTF-8"));
+          Pattern urlPathVariablePattern = Pattern.compile(".*/[0-9]+/.*");
+          Matcher matcher = urlPathVariablePattern.matcher(value);
+          if (matcher.matches()) {
+            value = value.split("/[0-9]+/")[0];
+          }
+          if (!value.startsWith("http://")) {
+            value = value.replace("/",".");
+            if (value.startsWith(".")) {
+              return value.substring(value.indexOf(".") + 1);
+            }
+            return value;
+          }
+        }
+      }
+
+      for (BinaryAnnotation binaryAnnotation : span.binaryAnnotations) {
+        if ("http.url".equals(binaryAnnotation.key)) {
+          String value = new String(binaryAnnotation.value, Charset.forName("UTF-8"));
+          Pattern urlPathVariablePattern = Pattern.compile(".*/[0-9]+/.*");
+          Matcher matcher = urlPathVariablePattern.matcher(value);
+          if (matcher.matches()) {
+            value = value.split("/[0-9]+/")[0];
+          }
+          value = value.replaceAll("http://[^/]+/","");
+          return value.replace("/",".");
+        }
+      }
+      return "";
+    }
+  }
+
+  private Set<String> tagSet = Sets.newHashSet();
+
+  private void storeTreeTag(String treeTag, String nodePath) throws ExecutionException, InterruptedException {
+    String existTag = treeTag;
+    if (!tagSet.contains(existTag))  {
+      BoundStatement selectBound = CassandraUtil.bindWithName(selectServiceTree, "select-tree-tag").setString("tag",treeTag);
+      existTag = transform(session.executeAsync(selectBound), new Function<ResultSet, String>() {
+        @Nullable
+        @Override
+        public String apply(@Nullable ResultSet input) {
+          if (null != input) {
+            Row row = input.one();
+            if (null != row) return row.getString("tag");
+          }
+          return null;
+        }
+      }).get();
+      tagSet.add(existTag);
+    }
+
+    if (StringUtils.isEmpty(existTag)) {
+      BoundStatement bound = CassandraUtil.bindWithName(insertServiceTree, "insert-tree-tag")
+        .setString("tag", treeTag)
+        .setSet("nodePath", Sets.newHashSet(nodePath));
+      setTtl(bound);
+      deduplicatingExecutor.maybeExecuteAsync(bound, nodePath);
+    } else {
+      BoundStatement bound = CassandraUtil.bindWithName(updateServiceTree, "update-tree-tag")
+        .setString("tag", treeTag)
+        .setSet("nodePath", Sets.newHashSet(nodePath));
+      deduplicatingExecutor.maybeExecuteAsync(bound, nodePath);
+    }
+  }
+
+  private void storeTreeNode(ZeusServiceTreeNode zeusServiceTreeNode) {
+    BoundStatement bound = CassandraUtil.bindWithName(insertServiceTreeNode, "insert-tree-node")
+      .setString("serviceName", zeusServiceTreeNode.getServiceName())
+      .setString("parentService", zeusServiceTreeNode.getParentService())
+      .setString("rootService", zeusServiceTreeNode.getRootService())
+      .setString("tag", zeusServiceTreeNode.getTreeTag());
+    setTtl(bound);
+    deduplicatingExecutor.maybeExecuteAsync(bound, zeusServiceTreeNode.toString());
+  }
+
+  private void setTtl(BoundStatement bound) {
+    bound.setInt("ttl_",ZEUS_TTL);
+  }
+
+  class ZeusServiceTreeNode {
+
+    private String serviceName;
+
+    private String parentService;
+
+    private String rootService;
+
+    private String treeTag;
+
+    public String getServiceName() {
+      return serviceName;
+    }
+
+    public void setServiceName(String serviceName) {
+      this.serviceName = serviceName;
+    }
+
+    public String getParentService() {
+      return parentService;
+    }
+
+    public void setParentService(String parentService) {
+      this.parentService = parentService;
+    }
+
+    public String getRootService() {
+      return rootService;
+    }
+
+    public void setRootService(String rootService) {
+      this.rootService = rootService;
+    }
+
+    public String getTreeTag() {
+      return treeTag;
+    }
+
+    public void setTreeTag(String treeTag) {
+      this.treeTag = treeTag;
+    }
+
+    @Override
+    public String toString() {
+      return "ZeusServiceTreeNode{" +
+        "serviceName='" + serviceName + '\'' +
+        ", parentService='" + parentService + '\'' +
+        ", rootService='" + rootService + '\'' +
+        ", treeTag='" + treeTag + '\'' +
+        '}';
+    }
+  }
+
+  class ZeusServiceTree {
+
+    private String treeTag;
+
+    private String treeJson;
+
+    public String getTreeTag() {
+      return treeTag;
+    }
+
+    public void setTreeTag(String treeTag) {
+      this.treeTag = treeTag;
+    }
+
+    public String getTreeJson() {
+      return treeJson;
+    }
+
+    public void setTreeJson(String treeJson) {
+      this.treeJson = treeJson;
     }
   }
 }

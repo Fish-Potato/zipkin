@@ -20,6 +20,7 @@ public class TraceException{
 
   private String className;
   private String methodName;
+  private String level;
   private String event;
   private String originMessage;
 
@@ -55,5 +56,12 @@ public class TraceException{
     this.originMessage = originMessage;
   }
 
+  public String getLevel() {
+    return level;
+  }
+
+  public void setLevel(String level) {
+    this.level = level;
+  }
 }
 
