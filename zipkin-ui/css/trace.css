@@ -38,7 +38,7 @@
 }
 
 #trace-container .span .handle {
-  width: 150px;
+  width: 200px;
   overflow: hidden;
   white-space: nowrap;
   float: left;
@@ -72,7 +72,7 @@
 
 #trace-container .span .duration-container {
   position: relative;
-  margin-left: 155px;
+  margin-left: 205px;
 }
 
 #trace-container #timeLabel.span {
@@ -136,21 +136,27 @@
 
 #trace-container .span.depth-0 .duration { background: rgba(66, 146, 198, 0.1); }
 #trace-container .span.depth-1 .duration { background: rgba(66, 146, 198, 0.20); }
-#trace-container .span.depth-2 .duration { background: rgba(66, 146, 198, 0.40); }
-#trace-container .span.depth-3 .duration { background: rgba(66, 146, 198, 0.60); }
-#trace-container .span.depth-4 .duration { background: rgba(66, 146, 198, 0.80); }
-#trace-container .span.depth-5 .duration { background: rgba(66, 146, 198, 1); }
+#trace-container .span.depth-2 .duration { background: rgba(66, 146, 198, 0.30); }
+#trace-container .span.depth-3 .duration { background: rgba(66, 146, 198, 0.40); }
+#trace-container .span.depth-4 .duration { background: rgba(66, 146, 198, 0.50); }
+#trace-container .span.depth-5 .duration { background: rgba(66, 146, 198, 0.60); }
+#trace-container .span.depth-6 .duration { background: rgba(66, 146, 198, 0.70); }
+#trace-container .span.depth-7 .duration { background: rgba(66, 146, 198, 0.80); }
+#trace-container .span.depth-8 .duration { background: rgba(66, 146, 198, 0.90); }
 
 #trace-container .span[data-error-type="transient"] .handle .service-name {
   background: #8a6d3b;
 }
 
-#trace-container .span[data-error-type="transient"].depth-0 .duration { background: rgba(230, 215, 140, 0.1); }
-#trace-container .span[data-error-type="transient"].depth-1 .duration { background: rgba(230, 215, 140, 0.20); }
+#trace-container .span[data-error-type="transient"].depth-0 .duration { background: rgba(230, 215, 140, 0.20); }
+#trace-container .span[data-error-type="transient"].depth-1 .duration { background: rgba(230, 215, 140, 0.30); }
 #trace-container .span[data-error-type="transient"].depth-2 .duration { background: rgba(230, 215, 140, 0.40); }
-#trace-container .span[data-error-type="transient"].depth-3 .duration { background: rgba(230, 215, 140, 0.60); }
-#trace-container .span[data-error-type="transient"].depth-4 .duration { background: rgba(230, 215, 140, 0.80); }
-#trace-container .span[data-error-type="transient"].depth-5 .duration { background: rgba(230, 215, 140, 1); }
+#trace-container .span[data-error-type="transient"].depth-3 .duration { background: rgba(230, 215, 140, 0.50); }
+#trace-container .span[data-error-type="transient"].depth-4 .duration { background: rgba(230, 215, 140, 0.60); }
+#trace-container .span[data-error-type="transient"].depth-5 .duration { background: rgba(230, 215, 140, 0.70); }
+#trace-container .span[data-error-type="transient"].depth-6 .duration { background: rgba(230, 215, 140, 0.80); }
+#trace-container .span[data-error-type="transient"].depth-7 .duration { background: rgba(230, 215, 140, 0.90); }
+#trace-container .span[data-error-type="transient"].depth-8 .duration { background: rgba(230, 215, 140, 1); }
 
 #trace-container .span[data-error-type="critical"] .handle .service-name {
   background: #a94442;
@@ -162,14 +168,20 @@
 #trace-container .span[data-error-type="critical"].depth-3 .duration { background: rgba(230, 162, 161, 0.60); }
 #trace-container .span[data-error-type="critical"].depth-4 .duration { background: rgba(230, 162, 161, 0.80); }
 #trace-container .span[data-error-type="critical"].depth-5 .duration { background: rgba(230, 162, 161, 1); }
+#trace-container .span[data-error-type="critical"].depth-6 .duration { background: rgba(230, 162, 161, 1); }
+#trace-container .span[data-error-type="critical"].depth-7 .duration { background: rgba(230, 162, 161, 1); }
+#trace-container .span[data-error-type="critical"].depth-8 .duration { background: rgba(230, 162, 161, 1); }
 
 
-#trace-container .span .handle .service-name.depth-0 { background: rgba(45, 79, 198, 1);  }
-#trace-container .span .handle .service-name.depth-1 { background: rgba(45, 79, 198, 0.9);  }
-#trace-container .span .handle .service-name.depth-2 { background: rgba(45, 79, 198, 0.8); }
-#trace-container .span .handle .service-name.depth-3 { background: rgba(45, 79, 198, 0.7);  }
-#trace-container .span .handle .service-name.depth-4 { background: rgba(45, 79, 198, 0.6);   }
-#trace-container .span .handle .service-name.depth-5 { background: rgba(45, 79, 198, 0.5);   }
+#trace-container .span .handle .service-name.depth-0 { background: rgba(45, 79, 198, 0.3);  }
+#trace-container .span .handle .service-name.depth-1 { background: rgba(45, 79, 198, 0.35);  }
+#trace-container .span .handle .service-name.depth-2 { background: rgba(45, 79, 198, 0.4); }
+#trace-container .span .handle .service-name.depth-3 { background: rgba(55, 79, 198, 0.5);  }
+#trace-container .span .handle .service-name.depth-4 { background: rgba(65, 79, 198, 0.6);   }
+#trace-container .span .handle .service-name.depth-5 { background: rgba(85, 79, 198, 0.7);   }
+#trace-container .span .handle .service-name.depth-6 { background: rgba(95, 79, 198, 0.8);   }
+#trace-container .span .handle .service-name.depth-7 { background: rgba(105, 79, 198, 0.9);   }
+#trace-container .span .handle .service-name.depth-8 { background: rgba(115, 79, 198, 1);   }
 
 
 #trace-controls form {

@@ -161,7 +161,7 @@ export default function traceToMustache(trace, logsUrl = undefined) {
         left: parseFloat(spanStartTs - traceTimestamp) / parseFloat(summary.duration) * 100,
         width: width < 0.1 ? 0.1 : width,
         depth: (spanDepth + 1) * 5 * 2 - 15,
-        depthClass: (spanDepth - 1) % 6,
+        depthClass: (spanDepth - 1) % 9,
         children: (groupByParentId[span.id] || []).map((s) => s.id).join(','),
         annotations: (span.annotations || []).map((a) => ({
           isCore: Constants.CORE_ANNOTATIONS.indexOf(a.value) !== -1,
