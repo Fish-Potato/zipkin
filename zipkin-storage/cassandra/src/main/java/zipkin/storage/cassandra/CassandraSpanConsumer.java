@@ -134,7 +134,10 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
    */
   @Override
   public ListenableFuture<Void> accept(List<Span> rawSpans) {
-    storeServiceCallTree(rawSpans);
+    /**
+     * 暂时不存这部分数据
+     */
+//    storeServiceCallTree(rawSpans);
     ImmutableSet.Builder<ListenableFuture<?>> futures = ImmutableSet.builder();
 
     ImmutableList.Builder<Span> spans = ImmutableList.builder();

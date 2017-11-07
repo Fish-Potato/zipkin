@@ -510,20 +510,12 @@ public final class CassandraSpanStore implements GuavaSpanStore {
 
   private ListeningScheduledExecutorService scheduledExecutor = MoreExecutors.listeningDecorator(Executors.newSingleThreadScheduledExecutor());
 
-  private Executor zeusExecutor = Executors.newCachedThreadPool();
-
 
   private void executeStoreTree() {
-    scheduledExecutor.scheduleAtFixedRate(new Runnable() {
-      @Override
-      public void run() {
-        // 避免数据还未录入，减去60秒的误差
-        long endTs = System.currentTimeMillis()-60000;
-        for (int i = 0; i < 5; i++) {
-          zeusExecutor.execute(new ZeusServiceRunnable(endTs-(i*200),2000000));
-        }
-      }
-    }, 10, 1, TimeUnit.SECONDS);
+    // 避免数据还未录入，减去60秒的误差
+    long endTs = System.currentTimeMillis()-60000;
+    scheduledExecutor.scheduleAtFixedRate(new ZeusServiceRunnable(endTs,1000)
+      , 10, 1, TimeUnit.SECONDS);
   }
 
   class ZeusServiceRunnable implements Runnable {
@@ -680,16 +672,13 @@ public final class CassandraSpanStore implements GuavaSpanStore {
           }
         }
       }
-      // 为了保证服务名的准确性，根span不从url中取
-      if (null != span.parentId) {
-        String serviceGroup = span.annotations.get(0).endpoint.serviceName;
-        String serviceName = getFromUrl(span);
-        if (!serviceName.startsWith(serviceGroup)) {
-          serviceName = serviceGroup + "." + serviceName;
-        }
-        return serviceName;
+      // 全部升级到2.1后 为了保证服务名的准确性，根span将不从url中取
+      String serviceGroup = span.annotations.get(0).endpoint.serviceName;
+      String serviceName = getFromUrl(span);
+      if (!StringUtils.isEmpty(serviceName) && !serviceName.startsWith(serviceGroup)) {
+        serviceName = serviceGroup + "." + serviceName;
       }
-      return "";
+      return serviceName;
     }
 
     /**
