@@ -70,7 +70,7 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
   private final PreparedStatement insertSpan;
   private final PreparedStatement insertServiceName;
   private final PreparedStatement insertSpanName;
-  private final PreparedStatement insertServiceTreeNode;
+  private final PreparedStatement insertSampledTraceId;
   private final Schema.Metadata metadata;
   private final DeduplicatingExecutor deduplicatingExecutor;
   private final CompositeIndexer indexer;
@@ -103,13 +103,11 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
             .value("bucket", 0) // bucket is deprecated on this index
             .value("span_name", QueryBuilder.bindMarker("span_name"))));
 
-    insertServiceTreeNode = session.prepare(
-      maybeUseTtl(QueryBuilder
-        .insertInto("zeus_service_node")
-        .value("service_name",QueryBuilder.bindMarker("serviceName"))
-        .value("parent_service", QueryBuilder.bindMarker("parentService"))
-        .value("root_service", QueryBuilder.bindMarker("rootService"))
-        .value("tag", QueryBuilder.bindMarker("tag"))));
+    insertSampledTraceId = session.prepare(maybeUseTtl(QueryBuilder
+      .insertInto("zeus_sampled_trace")
+      .value("service_name",QueryBuilder.bindMarker("serviceName"))
+      .value("trace_id", QueryBuilder.bindMarker("traceId"))
+      .value("ts",QueryBuilder.bindMarker("ts"))));
 
     deduplicatingExecutor = new DeduplicatingExecutor(session, WRITTEN_NAMES_TTL);
     indexer = new CompositeIndexer(session, indexCacheSpec, bucketCount, this.indexTtl);
@@ -127,7 +125,7 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
    */
   @Override
   public ListenableFuture<Void> accept(List<Span> rawSpans) {
-    storeServiceTree(rawSpans);
+    storeServiceTreeSample(rawSpans);
     ImmutableSet.Builder<ListenableFuture<?>> futures = ImmutableSet.builder();
 
     ImmutableList.Builder<Span> spans = ImmutableList.builder();
@@ -213,76 +211,33 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
 
   private final static Integer ZEUS_TTL = 604800000;
 
-  private void storeServiceTree(List<Span> spans) {
+  private void storeServiceTreeSample(List<Span> spans) {
     if (CollectionUtils.isEmpty(spans)) {
       return ;
     }
-    Map<Long,Span> spanMap = new HashMap<>();
-    Set<Long> parentIdSet = Sets.newHashSet();
-    for (Span span : spans) {
-      spanMap.put(span.id,span);
-      if (null != span.parentId) {
-        if (!isSqlQuery(span))
-          parentIdSet.add(span.parentId);
-      }
-    }
     Long traceId = spans.get(0).traceId;
-    String rootService = "";
-    if (spanMap.containsKey(traceId)) {
-      Span rootSpan = spanMap.get(traceId);
-      rootService = guessZeusServiceName(rootSpan);
-    }
-    Set<String> existHelper = Sets.newHashSet();
     for (Span span : spans) {
+      String servicePath = getServicePath(span);
       String serviceName = guessZeusServiceName(span);
-      if (StringUtils.isEmpty(serviceName)) {
-        continue;
-      }
-      String parentServiceName = guessZeusServiceName(spanMap.get(span.parentId));
-      if (!existHelper.contains(serviceName+"->"+parentServiceName)) {
-        ZeusServiceTreeNode treeNode = new ZeusServiceTreeNode();
-        treeNode.serviceName = serviceName;
-        treeNode.parentService = parentServiceName;
-        if (!StringUtils.isEmpty(rootService)) {
-          treeNode.rootService = rootService;
+      if (!StringUtils.isEmpty(serviceName)) {
+        if (SampleUtil.ifSample(StringUtils.isEmpty(servicePath)?serviceName:servicePath)) {
+          storeSampledTrace(traceId, serviceName);
         }
-        storeTreeNode(treeNode);
-        existHelper.add(serviceName+"->"+parentServiceName);
       }
     }
   }
-
-  private boolean isSqlQuery(Span span) {
-    for (BinaryAnnotation binaryAnnotation : span.binaryAnnotations) {
-      if (binaryAnnotation.key.equals("sql.query")) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-
 
   /**
    * 当不是所有应用升级到zeus2.1 会导致rootService不准确
    * @param span
    * @return
    */
-  private String guessRootService(Span span) {
+  private String getServicePath(Span span) {
     for (BinaryAnnotation binaryAnnotation : span.binaryAnnotations) {
       if ("servicePath".equals(binaryAnnotation.key) && null != binaryAnnotation.value) {
         String servicePath = new String(binaryAnnotation.value, Charset.forName("UTF-8"));
         if (!StringUtils.isEmpty(servicePath)) {
-          // 优先从header中获取服务名
-          String rootService;
-          if (servicePath.contains("#")) {
-            rootService = servicePath.substring(0,servicePath.indexOf("#"));
-          } else {
-            rootService = servicePath;
-          }
-          if (!StringUtils.isEmpty(rootService)) {
-            return rootService;
-          }
+          return servicePath;
         }
       }
     }
@@ -370,70 +325,13 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
   }
 
 
-  private void storeTreeNode(ZeusServiceTreeNode zeusServiceTreeNode) {
-    BoundStatement bound = CassandraUtil.bindWithName(insertServiceTreeNode, "insert-tree-node")
-      .setString("serviceName", zeusServiceTreeNode.getServiceName())
-      .setString("parentService", zeusServiceTreeNode.getParentService())
-      .setString("rootService", zeusServiceTreeNode.getRootService())
-      .setString("tag", zeusServiceTreeNode.getTreeTag());
-    setTtl(bound);
-    deduplicatingExecutor.maybeExecuteAsync(bound, zeusServiceTreeNode.toString());
+  private void storeSampledTrace(Long traceId, String serviceName) {
+    BoundStatement bound = CassandraUtil.bindWithName(insertSampledTraceId, "insert-sampled-trace")
+      .setString("serviceName", serviceName)
+      .setLong("traceId", traceId)
+      .setBytesUnsafe("ts", timestampCodec.serialize(System.currentTimeMillis()*1000));
+    if (indexTtl != null) bound.setInt("ttl_", indexTtl);
+    session.executeAsync(bound);
   }
 
-  private void setTtl(BoundStatement bound) {
-    bound.setInt("ttl_",ZEUS_TTL);
-  }
-
-  class ZeusServiceTreeNode {
-
-    private String serviceName;
-
-    private String parentService;
-
-    private String rootService;
-
-    private String treeTag;
-
-    public String getServiceName() {
-      return serviceName;
-    }
-
-    public void setServiceName(String serviceName) {
-      this.serviceName = serviceName;
-    }
-
-    public String getParentService() {
-      return parentService;
-    }
-
-    public void setParentService(String parentService) {
-      this.parentService = parentService;
-    }
-
-    public String getRootService() {
-      return rootService;
-    }
-
-    public void setRootService(String rootService) {
-      this.rootService = rootService;
-    }
-
-    public String getTreeTag() {
-      return treeTag;
-    }
-
-    public void setTreeTag(String treeTag) {
-      this.treeTag = treeTag;
-    }
-
-    @Override
-    public String toString() {
-      return "ZeusServiceTreeNode{" +
-        "serviceName='" + serviceName + '\'' +
-        ", parentService='" + parentService + '\'' +
-        ", rootService='" + rootService + '\'' +
-        ", treeTag='" + treeTag + '\'' +
-        '}';
-    }
-  }
 }
