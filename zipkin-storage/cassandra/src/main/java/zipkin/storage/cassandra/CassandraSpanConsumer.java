@@ -103,11 +103,11 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
             .value("bucket", 0) // bucket is deprecated on this index
             .value("span_name", QueryBuilder.bindMarker("span_name"))));
 
-    insertSampledTraceId = session.prepare(maybeUseTtl(QueryBuilder
+    insertSampledTraceId = session.prepare(QueryBuilder
       .insertInto("zeus_sampled_trace")
       .value("service_name",QueryBuilder.bindMarker("serviceName"))
       .value("trace_id", QueryBuilder.bindMarker("traceId"))
-      .value("ts",QueryBuilder.bindMarker("ts"))));
+      .value("bucket",QueryBuilder.bindMarker("bucket")));
 
     deduplicatingExecutor = new DeduplicatingExecutor(session, WRITTEN_NAMES_TTL);
     indexer = new CompositeIndexer(session, indexCacheSpec, bucketCount, this.indexTtl);
@@ -329,8 +329,7 @@ final class CassandraSpanConsumer implements GuavaSpanConsumer {
     BoundStatement bound = CassandraUtil.bindWithName(insertSampledTraceId, "insert-sampled-trace")
       .setString("serviceName", serviceName)
       .setLong("traceId", traceId)
-      .setBytesUnsafe("ts", timestampCodec.serialize(System.currentTimeMillis()*1000));
-    if (indexTtl != null) bound.setInt("ttl_", indexTtl);
+      .setLong("bucket", System.currentTimeMillis()/60000);
     session.executeAsync(bound);
   }
 

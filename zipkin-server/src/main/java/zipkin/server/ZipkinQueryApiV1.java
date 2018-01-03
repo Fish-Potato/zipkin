@@ -24,6 +24,7 @@ import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.CollectionUtils;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.context.request.WebRequest;
 import zipkin.*;
@@ -167,7 +168,7 @@ public class ZipkinQueryApiV1 {
     long stackSpanId = 4294967296L;
     for (Span span : trace) {
       for (BinaryAnnotation binaryAnnotation : span.binaryAnnotations) {
-        if (binaryAnnotation.key.equals("stackTrace")) {
+        if ("stackTrace".equals(binaryAnnotation.key)) {
           StackTrace stackTrace = JSON.parseObject(new String(binaryAnnotation.value, Charset.forName("UTF-8")), StackTrace.class);
           for (TraceEntry traceEntry : stackTrace.getEntryList()) {
             String level = traceEntry.getLevel();
@@ -184,8 +185,9 @@ public class ZipkinQueryApiV1 {
             Span.Builder builder = Span.builder();
 
             builder.id(stackSpanId + getStackSpanId(traceEntry.getLevel()));
-            if (null != getParentStackSpanId(level)) {
-              builder.parentId(stackSpanId + getParentStackSpanId(level));
+            Long parentSpanId = getParentStackSpanId(level);
+            if (null != parentSpanId) {
+              builder.parentId(stackSpanId + parentSpanId);
             } else {
               builder.parentId(span.id);
             }
@@ -243,11 +245,10 @@ public class ZipkinQueryApiV1 {
   }
 
   private boolean isCurrentException(TraceException traceE, TraceEntry traceEntry) {
-    Long parentIdEntry = getParentStackSpanId(traceEntry.getLevel());
-    if (null != parentIdEntry && parentIdEntry.equals(getParentStackSpanId(traceE.getLevel()))) {
-      return Integer.valueOf(traceE.getLevel().substring(traceE.getLevel().lastIndexOf(".")+1))
-        .equals(Integer.valueOf(traceEntry.getLevel().substring(traceEntry.getLevel().lastIndexOf(".")+1))+1);
+    if (null != traceE && !StringUtils.isEmpty(traceE.getLevel())) {
+      return traceE.getLevel().equals(traceEntry.getLevel());
     }
+
     return false;
   }
 
